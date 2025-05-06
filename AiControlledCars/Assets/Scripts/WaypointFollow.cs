@@ -3,63 +3,124 @@ using UnityStandardAssets.Utility;
 
 public class WaypointFollow : MonoBehaviour
 {
-    public WaypointProgressTracker progressTracker;  // Assign in Inspector or via GetComponent
-    public float speed = 10f;
-    public float rotSpeed = 5f;
-    
-    public float acceleration = 20f;
-    public float deceleration = 10f;
+    public WaypointProgressTracker progressTracker;
+    public float speed = 20f;
+    public float rotSpeed = 8f;
+
+    public float acceleration = 40f;
+    public float deceleration = 20f;
     private float currentSpeed = 0f;
 
-    public float maxSteerAngle = 30f;  // Maximum steering angle (turning sharpness)
+    public float maxSteerAngle = 45f;
     private float currentSteerAngle = 0f;
-    
-    // Smooth Steering Curve
-    public float smoothSteerFactor = 0.5f;  // Controls how smooth steering is at higher speeds
+
+    public float laneWidth = 3f;
+    public float avoidRadius = 5f;
+    public float avoidStrength = 2.5f; // 🔧 More avoidance push
+
+    public float overtakeOffsetAmount = 4f; // 🔧 Wider lateral moves during overtaking
+    public float detectionForwardAngle = 50f; // 🔧 Tighter cone = more aggressive overtakes
+    public float boostMultiplier = 1.3f;
+
+    private Vector3 currentTargetOffset;
+    private Transform lastTarget;
 
     void Update()
     {
         if (progressTracker == null || progressTracker.target == null) return;
 
-        // Get the target position from the progress tracker
-        Vector3 targetPos = progressTracker.target.position;
-
-        // Direction to the target
-        Vector3 direction = targetPos - transform.position;
-        direction.y = 0; // Keep car level on Y
-
-        // Calculate the steering angle based on the direction to the target
-        float distanceToTarget = direction.magnitude;
-        float targetAngle = Vector3.SignedAngle(transform.forward, direction, Vector3.up); // Get the angle to the target
-
-        // Smooth steering based on the distance to the target
-        currentSteerAngle = Mathf.Lerp(currentSteerAngle, Mathf.Clamp(targetAngle, -maxSteerAngle, maxSteerAngle), Time.deltaTime * rotSpeed);
-
-        // Apply a smooth steering factor for higher speeds (car handles smoother at higher speeds)
-        float smoothSteer = Mathf.Lerp(0f, currentSteerAngle, Mathf.Clamp(currentSpeed / speed, 0.2f, 1f));
-        
-        // Rotate smoothly toward the target with adjusted steering
-        if (direction != Vector3.zero)
+        if (progressTracker.target != lastTarget)
         {
-            Quaternion targetRotation = Quaternion.Euler(0f, transform.eulerAngles.y + smoothSteer, 0f);
-            transform.rotation = Quaternion.Slerp(transform.rotation, targetRotation, Time.deltaTime * rotSpeed);
+            currentTargetOffset = GetRandomLaneOffset();
+            lastTarget = progressTracker.target;
         }
 
-        // Accelerate or decelerate smoothly
-        if (distanceToTarget > 0.1f) // Only accelerate when there's a direction to go
+        Vector3 trueTarget = progressTracker.target.position;
+        Vector3 targetPos = trueTarget + currentTargetOffset;
+
+        Vector3 avoidanceOffset = GetAvoidanceOffset();
+        targetPos += avoidanceOffset * avoidStrength;
+
+        Vector3 direction = targetPos - transform.position;
+        direction.y = 0;
+
+        float distanceToTrueTarget = Vector3.Distance(transform.position, trueTarget);
+        float targetAngle = Vector3.SignedAngle(transform.forward, direction, Vector3.up);
+
+        currentSteerAngle = Mathf.Lerp(currentSteerAngle, Mathf.Clamp(targetAngle, -maxSteerAngle, maxSteerAngle), Time.deltaTime * rotSpeed);
+        float steerFactor = Mathf.Clamp01(currentSpeed / speed);
+        float smoothSteer = Mathf.Lerp(0f, currentSteerAngle, steerFactor);
+
+        if (direction != Vector3.zero)
         {
-            currentSpeed = Mathf.MoveTowards(currentSpeed, speed, acceleration * Time.deltaTime);
+            Quaternion targetRot = Quaternion.Euler(0f, transform.eulerAngles.y + smoothSteer, 0f);
+            transform.rotation = Quaternion.Slerp(transform.rotation, targetRot, Time.deltaTime * rotSpeed);
+        }
+
+        float speedTarget = speed;
+        if (IsBlockedAhead(out Vector3 lateralDodge))
+        {
+            speedTarget *= 0.9f; // 🔧 Don't slow down as much
+            targetPos += lateralDodge * (overtakeOffsetAmount + Random.Range(0.5f, 1.5f)); // 🔧 More lateral randomness
         }
         else
         {
-            currentSpeed = Mathf.MoveTowards(currentSpeed, 0f, deceleration * Time.deltaTime);
+            speedTarget *= boostMultiplier;
         }
 
-        // Add drift factor at high speeds to simulate sliding around corners
-        float driftFactor = Mathf.Clamp(currentSpeed / speed, 0.2f, 1f);
-        currentSteerAngle *= driftFactor; // The higher the speed, the more drift
+        currentSpeed = distanceToTrueTarget > 1f
+            ? Mathf.MoveTowards(currentSpeed, speedTarget, acceleration * Time.deltaTime)
+            : Mathf.MoveTowards(currentSpeed, 0f, deceleration * Time.deltaTime);
 
-        // Move forward with acceleration
         transform.Translate(Vector3.forward * currentSpeed * Time.deltaTime);
+    }
+
+    Vector3 GetRandomLaneOffset()
+    {
+        float offsetX = Random.Range(-laneWidth, laneWidth);
+        float offsetZ = Random.Range(-laneWidth, laneWidth);
+        return new Vector3(offsetX, 0f, offsetZ);
+    }
+
+    Vector3 GetAvoidanceOffset()
+    {
+        Vector3 avoidance = Vector3.zero;
+        Collider[] hits = Physics.OverlapSphere(transform.position, avoidRadius);
+
+        foreach (Collider hit in hits)
+        {
+            if (hit.gameObject != this.gameObject && hit.CompareTag("Car"))
+            {
+                Vector3 away = transform.position - hit.transform.position;
+                away.y = 0;
+                float distance = away.magnitude;
+                if (distance > 0)
+                    avoidance += away.normalized / distance;
+            }
+        }
+
+        return avoidance.normalized;
+    }
+
+    bool IsBlockedAhead(out Vector3 lateralOffset)
+    {
+        lateralOffset = Vector3.zero;
+        Collider[] hits = Physics.OverlapSphere(transform.position, avoidRadius);
+        foreach (Collider hit in hits)
+        {
+            if (hit.gameObject == this.gameObject || !hit.CompareTag("Car")) continue;
+
+            Vector3 toOther = hit.transform.position - transform.position;
+            toOther.y = 0;
+
+            float angle = Vector3.Angle(transform.forward, toOther);
+            if (angle < detectionForwardAngle)
+            {
+                Vector3 cross = Vector3.Cross(transform.forward, toOther);
+                lateralOffset = cross.y > 0 ? -transform.right : transform.right;
+                return true;
+            }
+        }
+        return false;
     }
 }
